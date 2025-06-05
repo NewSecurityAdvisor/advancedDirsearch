@@ -10,10 +10,11 @@ from typing import List, Tuple
 
 from rich.console import Console
 from rich.prompt import Confirm
+from rich.rule import Rule
 from playwright.async_api import async_playwright, Browser
 
 MAX_CONCURRENT_SCREENSHOTS = 10
-SCREENSHOT_TIMEOUT = 20000  # Milliseconds
+SCREENSHOT_TIMEOUT = 20000
 
 console = Console()
 CWD = Path.cwd()
@@ -29,24 +30,20 @@ def sanitize_url_for_foldername(url: str) -> str:
     parsed = urlparse(url)
     return re.sub(r'[:.]', '_', parsed.netloc)
 
+
 def sanitize_path_for_filename(path_str: str) -> str:
-    # If path is empty or just a slash, it's the root/index.
     if not path_str or path_str == "/":
         return "index"
 
     clean_path = path_str.split('?')[0].strip('/')
-
     sanitized = clean_path.replace('/', '_')
-
     sanitized = re.sub(r'\.(php|html|htm|asp|aspx|jsp|txt)$', '', sanitized, flags=re.IGNORECASE)
-
     sanitized = re.sub(r'[^a-zA-Z0-9_-]', '', sanitized)
 
     return sanitized if sanitized else "page"
 
 
 def run_dirsearch(url: str, extra_params: str, scan_dir: Path) -> Path:
-    """Runs dirsearch and saves the output into the dedicated scan directory."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_file = scan_dir / f"dirsearch_report_{timestamp}.txt"
     cmd = ['dirsearch', '-u', url, '--output', str(output_file), '--full-url'] + extra_params.split()
@@ -61,7 +58,7 @@ def run_dirsearch(url: str, extra_params: str, scan_dir: Path) -> Path:
         sys.exit(1)
     except subprocess.CalledProcessError as e:
         console.print(f"\n[red]Dirsearch exited with an error (Code: {e.returncode}).[/red]")
-        sys.exit(1)
+        return None
 
     return output_file
 
@@ -118,21 +115,17 @@ async def process_all_screenshots(
 ):
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCREENSHOTS)
     async with async_playwright() as p:
-        console.print(f"Launching browser...")
         browser = await p.chromium.launch()
-        console.print(
-            f"Starting screenshot capture with concurrency limit of [bold magenta]{MAX_CONCURRENT_SCREENSHOTS}[/bold magenta]...")
-
         tasks = []
 
         base_url = get_base_url(base_target_url)
         base_path = scan_screenshot_dir / "base.png"
         tasks.append(capture_screenshot_task(semaphore, browser, base_url, base_path))
 
-        # Task 2: Capture all 200-status URLs with sanitized path names.
         for _, url in results_200:
             url_path = urlparse(url).path
             base_name = sanitize_path_for_filename(url_path)
+
             counter = 0
             path_to_save = scan_screenshot_dir / f"{base_name}.png"
             while path_to_save.exists():
@@ -146,11 +139,8 @@ async def process_all_screenshots(
 
         await browser.close()
 
-    console.print("\n[bold green]All screenshot tasks finished.[/bold green]")
-
 
 def generate_gallery(html_output_path: Path, scan_screenshot_dir: Path):
-    console.print("Generating HTML gallery...")
     images = sorted([
         img for img in os.listdir(scan_screenshot_dir)
         if img.endswith(".png") and os.path.getsize(scan_screenshot_dir / img) > 0
@@ -175,7 +165,6 @@ def generate_gallery(html_output_path: Path, scan_screenshot_dir: Path):
 
         for img in images:
             relative_image_path = f"screenshots/{img}"
-
             f.write(f"<div class='card'><a href='{relative_image_path}' target='_blank'>")
             f.write(f"<h2>{img}</h2><div class='img-container'><img src='{relative_image_path}' alt='{img}'></div>")
             f.write("</a></div>")
@@ -185,58 +174,100 @@ def generate_gallery(html_output_path: Path, scan_screenshot_dir: Path):
         f"[blue]HTML gallery created: [link=file://{html_output_path.resolve()}]file://{html_output_path.resolve()}[/link][/blue]")
 
 
-def main():
-    try:
+async def run_scan_for_target(target_url: str, extra_params: str):
+    console.print(Rule(f"[bold yellow]Processing Target: {target_url}", style="yellow"))
+
+    sanitized_name = sanitize_url_for_foldername(target_url)
+    scan_dir = TOP_LEVEL_OUTPUT_DIR / sanitized_name
+    scan_screenshot_dir = scan_dir / "screenshots"
+    os.makedirs(scan_screenshot_dir, exist_ok=True)
+    console.print(f"Saving all output for this scan in: [bold cyan]{scan_dir}[/bold cyan]")
+
+    dirsearch_output_file = run_dirsearch(target_url, extra_params, scan_dir)
+    if not dirsearch_output_file:
+        console.print(f"[bold red]Skipping screenshot phase for {target_url} due to dirsearch error.[/bold red]")
+        return
+
+    results = parse_dirsearch_output(dirsearch_output_file)
+    if not results:
+        console.print("[yellow]Dirsearch found no accessible URLs for this target. Moving to next target.[/yellow]")
+        return
+
+    sorted_results = sort_results(results)
+    results_200 = [res for res in sorted_results if res[0] == 200]
+
+    console.print(f"Found [bold]{len(sorted_results)}[/bold] total URLs.")
+    console.print(
+        f"Found [bold green]{len(results_200)}[/bold green] URLs with status 200, which will be screenshotted.")
+
+    total_screenshots = len(results_200) + 1
+    if not results_200:
+        if not Confirm.ask("No 200-status pages found. Proceed with screenshot of the base URL only?"):
+            return
+    elif total_screenshots > 15:
+        if not Confirm.ask(f"This will generate up to {total_screenshots} screenshots. Continue?"):
+            return
+
+    console.print(
+        f"Starting screenshot capture with concurrency limit of [bold magenta]{MAX_CONCURRENT_SCREENSHOTS}[/bold magenta]...")
+    await process_all_screenshots(results_200, target_url, scan_screenshot_dir)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    html_output_file = scan_dir / f"gallery_{timestamp}.html"
+    generate_gallery(html_output_file, scan_screenshot_dir)
+
+
+async def main():
+    targets = []
+
+    console.print(Rule("[bold magenta]Advanced Dirsearch & Screenshot Tool", style="magenta"))
+    console.print("Select input method:")
+    console.print("[1] Single URL")
+    console.print("[2] URL List File")
+    choice = input("> ")
+
+    if choice == '1':
         url = input("Enter the target URL: ").strip()
-        if not url:
-            console.print("[red]URL cannot be empty.[/red]")
+        if url:
+            targets.append(url)
+    elif choice == '2':
+        file_path_str = input("Enter the path to the URL list file: ").strip()
+        file_path = Path(file_path_str)
+        if file_path.is_file():
+            with open(file_path, 'r') as f:
+                targets = [line.strip() for line in f if line.strip()]
+        else:
+            console.print(f"[red]Error: File not found at '{file_path_str}'[/red]")
             return
+    else:
+        console.print("[red]Invalid choice.[/red]")
+        return
 
-        if not (url.startswith("http://") or url.startswith("https://")):
-            console.print(f"[yellow]Scheme not provided. Defaulting to https://[/yellow]")
-            url = f"https://{url}"
+    if not targets:
+        console.print("[red]No target URLs to scan. Exiting.[/red]")
+        return
 
-        sanitized_name = sanitize_url_for_foldername(url)
-        scan_dir = TOP_LEVEL_OUTPUT_DIR / sanitized_name
-        scan_screenshot_dir = scan_dir / "screenshots"
-        os.makedirs(scan_screenshot_dir, exist_ok=True)
-        console.print(f"Saving all output for this scan in: [bold cyan]{scan_dir}[/bold cyan]")
+    normalized_targets = []
+    for t in targets:
+        if not (t.startswith("http://") or t.startswith("https://")):
+            normalized_targets.append(f"https://{t}")
+        else:
+            normalized_targets.append(t)
 
-        extra_params = input("Enter optional Dirsearch parameters (or leave empty): ")
+    console.print("\nEnter any additional parameters for dirsearch (e.g., -w wordlist.txt --crawl).")
+    extra_params = input("Optional Dirsearch parameters: ").strip()
 
-        dirsearch_output_file = run_dirsearch(url, extra_params, scan_dir)
-        results = parse_dirsearch_output(dirsearch_output_file)
+    for i, target in enumerate(normalized_targets):
+        await run_scan_for_target(target, extra_params)
+        if i < len(normalized_targets) - 1:
+            console.print("\n")
 
-        if not results:
-            console.print("[yellow]Dirsearch found no accessible URLs. Exiting.[/yellow]")
-            return
-
-        sorted_results = sort_results(results)
-        results_200 = [res for res in sorted_results if res[0] == 200]
-
-        console.print(f"Found [bold]{len(sorted_results)}[/bold] total URLs.")
-        console.print(
-            f"Found [bold green]{len(results_200)}[/bold green] URLs with status 200, which will be screenshotted.")
-
-        if not results_200:
-            if not Confirm.ask("No 200-status pages found. Proceed with screenshot of the base URL only?"):
-                return
-        elif len(results_200) > 15:
-            if not Confirm.ask(f"This will generate up to {len(results_200) + 1} screenshots. Continue?"):
-                return
-
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        html_output_file = scan_dir / f"gallery_{timestamp}.html"
-
-        awaitable = process_all_screenshots(results_200, url, scan_screenshot_dir)
-        asyncio.run(awaitable)
-
-        generate_gallery(html_output_file, scan_screenshot_dir)
-
-    except KeyboardInterrupt:
-        console.print("\n[bold yellow]Process interrupted by user. Exiting.[/bold yellow]")
-        sys.exit(0)
+    console.print(Rule("[bold green]All scans completed.", style="green"))
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Process interrupted by user. Exiting.[/bold yellow]")
+        sys.exit(0)
