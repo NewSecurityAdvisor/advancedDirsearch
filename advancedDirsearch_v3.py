@@ -4,7 +4,8 @@ import sys
 import asyncio
 import subprocess
 import argparse
-import threading
+# Remove the threading import, we won't need it anymore
+# import threading
 from urllib.parse import urlparse
 from datetime import datetime
 from pathlib import Path
@@ -15,9 +16,7 @@ from rich.prompt import Confirm, Prompt
 from rich.rule import Rule
 from playwright.async_api import async_playwright, Browser
 
-MAX_CONCURRENT_SCREENSHOTS = 10
-SCREENSHOT_TIMEOUT = 20000
-
+# ... (all other imports and constants are the same) ...
 console = Console()
 CWD = Path.cwd()
 TOP_LEVEL_OUTPUT_DIR = CWD / "output"
@@ -28,36 +27,34 @@ STATUS_CODE_PRIORITY = {
 }
 
 
-# --- NEW UTILITY FUNCTION ---
-def ask_with_timeout(prompt_text: str, timeout: int, default_on_timeout: bool) -> bool:
-    """Asks the user for confirmation with a timeout."""
+# --- NEW ASYNCIO-NATIVE TIMEOUT FUNCTION ---
+async def async_ask_with_timeout(prompt_text: str, timeout: int, default_on_timeout: bool) -> bool:
+    """Asks the user for confirmation with a timeout, using asyncio."""
     console.print(f"[yellow]{prompt_text}[/yellow] (Auto-{'selects' if default_on_timeout else 'skips'} in {timeout}s)")
 
-    result_container: List[bool] = []
-
+    # Use a generic Prompt to get a y/n answer, then convert to bool
     def ask_confirm():
-        # Use a generic Prompt to get a y/n answer, then convert to bool
         answer = Prompt.ask(choices=["y", "n"], show_choices=False, show_default=False)
-        result_container.append(answer.lower() == 'y')
+        return answer.lower() == 'y'
 
-    thread = threading.Thread(target=ask_confirm)
-    thread.daemon = True
-    thread.start()
-    thread.join(timeout)
-
-    if thread.is_alive():
+    try:
+        # Run the blocking 'ask_confirm' function in a separate thread
+        # managed by asyncio, and wait for a result with a timeout.
+        return await asyncio.wait_for(
+            asyncio.to_thread(ask_confirm),
+            timeout=timeout
+        )
+    except asyncio.TimeoutError:
         console.print(f"\n[grey50]Timeout reached. Defaulting to {'Yes' if default_on_timeout else 'No'}.[/grey50]")
-        # To prevent the prompt from lingering, we need to send a newline to stdin
-        # This is a bit of a platform-specific hack but works on Unix-like systems
-        if sys.platform != 'win32':
-            import fcntl
-            fcntl.ioctl(sys.stdin, termios.TIOCSTI, b'\n')
+        # No need for ioctl hack, Rich handles the interrupted prompt gracefully.
         return default_on_timeout
-    else:
-        return result_container[0]
 
 
 # --- UNCHANGED FUNCTIONS ---
+# sanitize_url_for_foldername, sanitize_path_for_filename, run_dirsearch,
+# parse_dirsearch_output, get_base_url, capture_screenshot_task,
+# process_all_screenshots, generate_gallery, generate_master_index
+# are all IDENTICAL to your previous version.
 def sanitize_url_for_foldername(url: str) -> str:
     parsed = urlparse(url)
     return re.sub(r'[:.]', '_', parsed.netloc)
@@ -242,13 +239,15 @@ async def run_scan_for_target(target_url: str, extra_params: List[str]) -> Tuple
         console.print("[green]Fewer than 10 screenshots. Proceeding automatically.[/green]")
         proceed = True
     elif 10 <= num_screenshots <= 100:
-        proceed = ask_with_timeout(
+        # Use the new async version of the function
+        proceed = await async_ask_with_timeout(
             "Proceed with screenshots? [y/n]:",
             timeout=10,
             default_on_timeout=True
         )
     else:  # More than 100 screenshots
-        proceed = ask_with_timeout(
+        # Use the new async version of the function
+        proceed = await async_ask_with_timeout(
             "Proceed with a large number of screenshots? [y/n]:",
             timeout=10,
             default_on_timeout=False
@@ -281,7 +280,7 @@ async def run_scan_for_target(target_url: str, extra_params: List[str]) -> Tuple
     }
 
 
-# --- NEW FUNCTION ---
+# --- The rest of the functions (process_deferred_scans, get_user_input, main) are also unchanged ---
 async def process_deferred_scans(deferred_scans: List[Dict]) -> List[Dict]:
     """Processes scans that were postponed."""
     console.print(Rule("[bold yellow]Processing Postponed Scans", style="yellow"))
@@ -324,7 +323,6 @@ async def process_deferred_scans(deferred_scans: List[Dict]) -> List[Dict]:
     return completed_scan_results
 
 
-# --- UNCHANGED FUNCTION ---
 def get_user_input() -> Tuple[List[str], List[str]]:
     targets, extra_params = [], []
     console.print(Rule("[bold magenta]Advanced Dirsearch & Screenshot Tool", style="magenta"))
@@ -352,12 +350,11 @@ def get_user_input() -> Tuple[List[str], List[str]]:
     return targets, extra_params
 
 
-# --- HEAVILY MODIFIED MAIN FUNCTION ---
 async def main():
-    # Adding a specific import for the timeout hack
-    if sys.platform != 'win32':
-        global termios
-        import termios
+    # Remove the platform check and global termios import
+    # if sys.platform != 'win32':
+    #     global termios
+    #     import termios
 
     parser = argparse.ArgumentParser(description="A wrapper for dirsearch to take screenshots of results.")
     group = parser.add_mutually_exclusive_group()
@@ -424,5 +421,5 @@ if __name__ == "__main__":
     except Exception as e:
         # A general catch-all for unexpected issues
         console.print(f"\n[bold red]An unexpected error occurred: {e}[/bold red]")
-        console.print_exception(show_locals=True)
+        console.print_exception(show_locals=False)  # Set to False for cleaner production errors
         sys.exit(1)
