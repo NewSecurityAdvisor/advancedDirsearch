@@ -104,9 +104,7 @@ async def process_all_screenshots(results_200: List[Tuple[int, str]], base_targe
     base_path = scan_screenshot_dir / "base.png"
     async with async_playwright() as p:
         browser = await p.chromium.launch()
-        # Immer ein Screenshot der Basis-URL machen
         tasks = [capture_screenshot_task(semaphore, browser, get_base_url(base_target_url), base_path)]
-        # Screenshots für alle 200er Ergebnisse
         for _, url in results_200:
             base_name = sanitize_path_for_filename(urlparse(url).path)
             path_to_save = scan_screenshot_dir / f"{base_name}.png"
@@ -199,7 +197,6 @@ async def run_scan_for_target(target_url: str, extra_params: List[str]) -> Optio
     console.print(
         f"Found [bold]{len(results)}[/bold] total URLs, [bold green]{len(results_200)}[/bold green] with status 200.")
 
-    # KEINE ABFRAGE MEHR - ES GEHT IMMER DIREKT WEITER
     console.print(
         f"Starting screenshot capture for {len(results_200) + 1} URLs with concurrency limit of [bold magenta]{MAX_CONCURRENT_SCREENSHOTS}[/bold magenta]...")
     base_screenshot_path = await process_all_screenshots(results_200, target_url, scan_screenshot_dir)
@@ -240,7 +237,6 @@ def get_user_input() -> Tuple[List[str], List[str]]:
         extra_params_str = Prompt.ask("Optional Dirsearch parameters", default="").strip()
         extra_params = extra_params_str.split()
     return targets, extra_params
---
 async def main():
     parser = argparse.ArgumentParser(description="A wrapper for dirsearch to take screenshots of results.")
     group = parser.add_mutually_exclusive_group()
